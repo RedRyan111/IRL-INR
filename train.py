@@ -18,8 +18,8 @@ from models import FunctionRepresentation, HyperNetwork
 from utils import find_center, get_theta
 from data.dataloader import get_train_dataset, get_val_dataset, get_train_dataloader, get_val_dataloader
 
-if __name__ == '__main__':
 
+def get_config():
     # Get config file from command line arguments
     if len(sys.argv) != 2:
         raise (RuntimeError("Wrong arguments, use python main.py <config_path>"))
@@ -29,8 +29,10 @@ if __name__ == '__main__':
     with open(config_path) as f:
         config = json.load(f)
 
-    device = config["device"]
+    return config
 
+
+def save_config_file():
     # Create a folder to store experiment results
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     directory = "{}_{}_experiment".format(timestamp, config["dataset"])
@@ -39,6 +41,18 @@ if __name__ == '__main__':
     # Save config file in experiment directory
     with open(directory + '/config.json', 'w') as f:
         json.dump(config, f)
+
+
+def print_num_of_model_params(model, model_name):
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"total parameters of {model_name} : {total_params / 1000 / 1000:.2f} M")
+
+
+if __name__ == '__main__':
+    config = get_config()
+    save_config_file()
+
+    device = config["device"]
 
     # Dataset
     train_dataset = get_train_dataset(config['dataset'], transform=None)  # Split is for stl-10
@@ -56,22 +70,17 @@ if __name__ == '__main__':
     fourier_feature = FourierFeatures(frequency_matrix)
 
     # FunctionRepresentation
-    function_representation = FunctionRepresentation(config["feature_dim"], config["layer_sizes"],
-                                                     config["num_frequencies"]).to(device)
+    function_representation = FunctionRepresentation(config["feature_dim"], config["layer_sizes"], config["num_frequencies"])
+    function_representation = function_representation.to(device)
 
     # HyperNetwork
-    hypernetwork = HyperNetwork(function_representation, config["latent_dim"], config["hypernet_layer_sizes"]).to(
-        device)
+    hypernetwork = HyperNetwork(function_representation, config["latent_dim"], config["hypernet_layer_sizes"])
+    hypernetwork = hypernetwork.to(device)
 
-    # Calculate Model Size
-    total_params = sum(p.numel() for p in encoder.parameters())
-    print('total parameters of Encoder: %.2f M' % (total_params / 1000 / 1000))
-
-    total_params = sum(p.numel() for p in function_representation.parameters())
-    print('total parameters of Function Representation: %.2f M' % (total_params / 1000 / 1000))
-
-    total_params = sum(p.numel() for p in hypernetwork.parameters())
-    print('total parameters of HyperNetwork: %.2f M' % (total_params / 1000 / 1000))
+    # Print Model Size
+    print_num_of_model_params(encoder, 'Encoder')
+    print_num_of_model_params(function_representation, 'Function Representation')
+    print_num_of_model_params(hypernetwork, 'HyperNetwork')
 
     # Optimizer
     optimizer_hyper = torch.optim.Adam(hypernetwork.forward_layers.parameters(),
@@ -90,10 +99,13 @@ if __name__ == '__main__':
         train_recon = 0.
         train_consis = 0.
         for i, dict in tqdm(enumerate(train_dataloader)):
-            time.sleep(0.1)
+            print(f"dict: ")
+            for key in dict:
+                print(f"{key}: {torch.tensor(dict[key]).shape}")
+
+            time.sleep(0.1)  # ??????
             images = dict['image']
             images = transforms.RandomRotation(180)(images)
-            b = images.shape[0]
             images = images.to(device)
 
             ### SYMMETRY BREAKING LOSS###
@@ -113,24 +125,25 @@ if __name__ == '__main__':
 
             # Input coordinates of INR are transformed by predicted theta and tau
             if config["dataset"] in ["wm811k", "plankton", "5hdb"]:
-                x_coord = make_coord(b, config["resolution"], -pred_theta,
+                x_coord = make_coord(config["batch_size"], config["resolution"], -pred_theta,
                                      0 * pred_center)  # We assume that only rotations have been applied to these datasets.
             elif config["dataset"] in ["MNIST-U", "galaxy_zoo", "dsprites"]:
-                x_coord = make_coord(b, config["resolution"], -pred_theta,
+                x_coord = make_coord(config["batch_size"], config["resolution"], -pred_theta,
                                      pred_center)  # We assume that rotations & translations have been applied to these datasets.
             # Coordinates are transformed to fourier feature
             fourier_coords = fourier_feature(x_coord).to(device)
             # Generate parameters of INR
             all_weights, all_biases = hypernetwork(z1)
 
-            generated_images = torch.empty(b, config["resolution"] ** 2, config["feature_dim"]).to(device)
-            for j in range(b):
+            generated_images = torch.empty(config["batch_size"], config["resolution"] ** 2, config["feature_dim"]).to(
+                device)
+            for j in range(config["batch_size"]):
                 generated_images[j] = function_representation(fourier_coords[j], all_weights[j], all_biases[j]).view(
                     config["resolution"] ** 2, config["feature_dim"])
 
-            images = images.view(b, -1)
+            images = images.view(config["batch_size"], -1)
             # Calculate reconstruction loss
-            loss_recon = mse(images, generated_images.view(b, -1))
+            loss_recon = mse(images, generated_images.view(config["batch_size"], -1))
 
             ### CONSISTENCY LOSS ###
 
@@ -143,7 +156,7 @@ if __name__ == '__main__':
             elif config["dataset"] in ["MNIST-U", "galaxy_zoo", "dsprites"]:
                 # We assume that rotations & translations have been applied to these datasets. So we apply random translation for augmentation
                 translated_images = torch.empty(rotated_images.shape)
-                for k in range(b):
+                for k in range(config["batch_size"]):
                     d1, d2 = 5 * torch.randn(1).item(), 5 * torch.randn(1).item()
                     M = np.float32([[1, 0, d1], [0, 1, d2]])
                     rotated_image = rotated_images[k].cpu().numpy()
@@ -172,10 +185,10 @@ if __name__ == '__main__':
             optimizer_hyper.zero_grad()
             optimizer_encoder.zero_grad()
 
-            train_loss += loss.item() * b
-            train_pred += loss_pred.item() * b
-            train_recon += loss_recon.item() * b
-            train_consis += (loss_consis.mean()).item() * b
+            train_loss += loss.item() * config["batch_size"]
+            train_pred += loss_pred.item() * config["batch_size"]
+            train_recon += loss_recon.item() * config["batch_size"]
+            train_consis += (loss_consis.mean()).item() * config["batch_size"]
 
         print(
             f"{epoch + 1}th Epoch, recon_loss:{train_recon / len(train_dataset)}, pred_loss:{train_pred / len(train_dataset)}, consis_loss:{train_consis / len(train_dataset)}, total_loss:{train_loss / len(train_dataset)},")
@@ -203,17 +216,20 @@ if __name__ == '__main__':
                 fourier_coords = fourier_feature(x_coord).to(device)
                 all_weights, all_biases = hypernetwork(z)
 
-                generated_images = torch.empty(b, config["resolution"] ** 2, config["feature_dim"]).to(device)
-                for j in range(b):
+                generated_images = torch.empty(config["batch_size"], config["resolution"] ** 2,
+                                               config["feature_dim"]).to(device)
+                for j in range(config["batch_size"]):
                     # Set weights and biases as predicted by hypernetwork & input to fourier coordinates and then generate images
                     generated_images[j] = function_representation(fourier_coords[j], all_weights[j],
                                                                   all_biases[j]).view(config["resolution"] ** 2,
                                                                                       config["feature_dim"])
 
                 # Images for Appendix E
-                save_image(images.view(b, config["feature_dim"], config["resolution"], config["resolution"]),
+                save_image(images.view(config["batch_size"], config["feature_dim"], config["resolution"],
+                                       config["resolution"]),
                            directory + '/valset_{}th_input.png'.format(epoch + 1))
-                save_image(generated_images.view(b, config["feature_dim"], config["resolution"], config["resolution"]),
+                save_image(generated_images.view(config["batch_size"], config["feature_dim"], config["resolution"],
+                                                 config["resolution"]),
                            directory + '/valset_{}th_output.png'.format(epoch + 1))
 
                 # rotate just 'one' single image
@@ -231,9 +247,9 @@ if __name__ == '__main__':
                 theta = get_theta(pred_center)
 
                 if config["dataset"] in ["wm811k", "plankton", "5hdb"]:
-                    x_coord = make_coord(b, config["resolution"], -theta * 0, 0 * pred_center)
+                    x_coord = make_coord(config["batch_size"], config["resolution"], -theta * 0, 0 * pred_center)
                 elif config["dataset"] in ["MNIST-U", "galaxy_zoo", "dsprites"]:
-                    x_coord = make_coord(b, config["resolution"], -theta * 0, 0 * pred_center)
+                    x_coord = make_coord(config["batch_size"], config["resolution"], -theta * 0, 0 * pred_center)
 
                 fourier_coords = fourier_feature(x_coord).to(device)
                 all_weights, all_biases = hypernetwork(z)
